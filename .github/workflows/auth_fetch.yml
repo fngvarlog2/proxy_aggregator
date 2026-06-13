@@ -1,44 +1,44 @@
-name: Hourly Proxy Update
+name: Auto Update Proxies
 
 on:
   schedule:
-    - cron: "0 * * * *" # Fires every 30 minutes
-  workflow_dispatch: # Allows you to manually click "Run workflow" in GitHub UI
-
-permissions:
-  contents: write # Crucial: Gives the bot permission to push sub.txt back to your repo
+    # Runs every 2 hours (At minute 0 of every 2nd hour)
+    - cron: "0 */2 * * *"
+  workflow_dispatch: # Allows you to trigger it manually from the GitHub website
 
 jobs:
-  build-and-run:
+  update-proxies:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository code
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Python Environment
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-          cache: "pip"
+          python-with: "3.11"
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install httpx
 
       - name: Run Aggregator Script
-        run: python scraper.py
+        run: |
+          chmod +x main.py
+          python main.py
 
-      - name: Commit and Push Subscriptions
+      - name: Commit and Push Changes
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git add sub.txt sub_base64.txt
 
-          # Check if files changed before committing to prevent empty commit errors
-          if git diff-index --quiet HEAD; then
-            echo "No configuration updates detected. Skipping push."
+          # Check if files changed to prevent empty commits
+          git add sub.txt sub_base64.txt
+          if git diff --cached --quiet; then
+            echo "No changes detected in proxy feeds. Skipping commit."
           else
-            git commit -m "Automated Sync: Updated working proxy configs [skip ci]"
-            git push
+            git commit -m "chore: automated proxy ecosystem update [skip ci]"
+            git push origin main
           fi

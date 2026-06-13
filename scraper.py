@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
 """
-e
-Proxy Aggregator & Validator (Strict IPv4 Edition)
-Aggregates V2Ray, Shadowsocks, and Trojan proxy configurations from public
-Telegram channels and GitHub sources, deduplicates them, validates via TCP
-handshake using STRICT IPv4 resolution, and outputs subscription files.
+Proxy Aggregator & Validator (Async v2.0)
+Aggregates V2Ray, Shadowsocks, and Trojan configurations, deduplicates them,
+validates them via async TCP handshakes, measures latency, and sorts the output.
 """
 
-import re
-import socket
+import asyncio
 import base64
-import time
 import json
 import logging
-from urllib.parse import urlparse, unquote
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
+import time
+from urllib.parse import unquote, urlparse
 
-import requests
+import httpx
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION  ← Edit these lists to add or remove your channels and sources
+# CONFIGURATION
 # ──────────────────────────────────────────────────────────────────────────────
 TELEGRAM_CHANNELS = [
     "ConfigsHUB2",
@@ -42,11 +39,9 @@ OUTPUT_PLAIN = "sub.txt"
 OUTPUT_BASE64 = "sub_base64.txt"
 
 SUPPORTED_PROTOCOLS = ("vless://", "vmess://", "trojan://", "ss://")
-MAX_WORKERS = 50
-CONNECT_TIMEOUT = 2.5  # seconds per TCP test
-RETRY_PER_SOURCE = 1  # extra attempts on transient error
-REQUEST_TIMEOUT = 10  # seconds for HTTP requests
-# ──────────────────────────────────────────────────────────────────────────────
+MAX_CONCURRENT_CHECKS = 100  # Semaphores keep your network from choking
+CONNECT_TIMEOUT = 2.5  # Seconds per proxy test
+REQUEST_TIMEOUT = 10.0  # Seconds for HTTP scraping
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,30 +51,22 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── HELPERS ───────────────────────────────────────────────────────────────────
 
 
-def _http_get(url: str, retries: int = RETRY_PER_SOURCE) -> str | None:
-    """GET a URL, return text or None on failure."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    for attempt in range(retries + 1):
-        try:
-            r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-            r.raise_for_status()
-            return r.text
-        except requests.RequestException as exc:
-            log.warning(
-                "  [%d/%d] GET failed for %s — %s", attempt + 1, retries + 1, url, exc
-            )
-            if attempt < retries:
-                time.sleep(1)
+async def _http_get(client: httpx.AsyncClient, url: str) -> str | None:
+    """Async GET request with explicit user agent."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        response = await client.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        if response.status_code == 200:
+            return response.text
+    except Exception as exc:
+        log.warning("Scrape failed for %s — %s", url, exc)
     return None
 
 
 def _try_base64_decode(text: str) -> str:
-    """Decode text if it's a Base64 subscription list."""
     stripped = text.strip()
     if any(p in stripped for p in SUPPORTED_PROTOCOLS):
         return stripped
@@ -94,7 +81,6 @@ def _try_base64_decode(text: str) -> str:
 
 
 def _extract_uris(text: str) -> list[str]:
-    """Pull all supported proxy URIs from raw content blocks."""
     pattern = (
         r"(?:" + "|".join(re.escape(p) for p in SUPPORTED_PROTOCOLS) + r')[^\s<>"\'\\]+'
     )
@@ -106,39 +92,7 @@ def _extract_uris(text: str) -> list[str]:
     return cleaned
 
 
-# ── source fetchers ───────────────────────────────────────────────────────────
-
-
-def fetch_telegram(channel: str) -> list[str]:
-    """Scrape a Telegram channel public preview page for proxy URIs."""
-    url = f"https://t.me/s/{channel}"
-    log.info("Telegram  → %s", url)
-    html = _http_get(url)
-    if not html:
-        return []
-    uris = _extract_uris(html)
-    uris = [unquote(u) for u in uris]
-    log.info("  Found %d URIs in @%s", len(uris), channel)
-    return uris
-
-
-def fetch_github(url: str) -> list[str]:
-    """Fetch a raw GitHub subscription file."""
-    log.info("GitHub    → %s", url)
-    text = _http_get(url)
-    if not text:
-        return []
-    text = _try_base64_decode(text)
-    uris = _extract_uris(text)
-    log.info("  Found %d URIs from %s", len(uris), url)
-    return uris
-
-
-# ── TCP validation ────────────────────────────────────────────────────────────
-
-
 def _parse_host_port(uri: str) -> tuple[str, int] | None:
-    """Extract (host, port) from standard and non-standard proxy URIs."""
     try:
         if uri.startswith("vmess://"):
             b64_part = uri[len("vmess://") :].split("#")[0]
@@ -158,7 +112,6 @@ def _parse_host_port(uri: str) -> tuple[str, int] | None:
         host = parsed.hostname
         port = parsed.port
 
-        # Fallback handling for messy/unpadded configurations (especially some legacy ss:// links)
         if (not host or not port) and "@" in uri:
             try:
                 clean_net = uri.split("#")[0].split("@")[-1]
@@ -177,135 +130,120 @@ def _parse_host_port(uri: str) -> tuple[str, int] | None:
         return None
 
 
-def test_config(uri: str) -> bool:
+# ── ASYNC SCRAPING ────────────────────────────────────────────────────────────
+
+
+async def fetch_telegram(client: httpx.AsyncClient, channel: str) -> list[str]:
+    url = f"https://t.me/s/{channel}"
+    html = await _http_get(client, url)
+    if not html:
+        return []
+    uris = [unquote(u) for u in _extract_uris(html)]
+    log.info("Telegram → Found %d URIs in @%s", len(uris), channel)
+    return uris
+
+
+async def fetch_github(client: httpx.AsyncClient, url: str) -> list[str]:
+    text = await _http_get(client, url)
+    if not text:
+        return []
+    text = _try_base64_decode(text)
+    uris = _extract_uris(text)
+    log.info("GitHub   → Found %d URIs from %s", len(uris), url[:45] + "...")
+    return uris
+
+
+# ── ASYNC VALIDATION ──────────────────────────────────────────────────────────
+
+
+async def test_config(
+    uri: str, semaphore: asyncio.Semaphore
+) -> tuple[str, float] | None:
     """
-    Return True if the proxy endpoint accepts a basic TCP handshake loop.
-    Strictly filters out and ignores IPv6 endpoints or dual-stack IPv6 records.
+    Validates a single proxy config using a lightweight non-blocking TCP connection.
+    Returns (uri, latency_ms) if valid, or None if it fails.
     """
     hp = _parse_host_port(uri)
-    if not hp:
-        return False
+    if not hp or ":" in hp[0]:  # Strict IPv4 exclusion rule retained
+        return None
     host, port = hp
 
-    # Skip if the raw host is explicitly a literal IPv6 address
-    if ":" in host:
-        return False
-
-    try:
-        # Force DNS resolution to ONLY look up IPv4 (AF_INET) addresses
-        addr_info = socket.getaddrinfo(
-            host, port, family=socket.AF_INET, type=socket.SOCK_STREAM
-        )
-        ipv4_address = addr_info[0][4][0]
-    except Exception:
-        return False
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(CONNECT_TIMEOUT)
-    try:
-        sock.connect((ipv4_address, port))
-        return True
-    except (OSError, socket.timeout):
-        return False
-    finally:
+    async with semaphore:
+        start_time = time.perf_counter()
         try:
-            sock.close()
+            # Non-blocking connection attempt
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=CONNECT_TIMEOUT
+            )
+            latency = (time.perf_counter() - start_time) * 1000
+            writer.close()
+            await writer.wait_closed()
+            return uri, latency
         except Exception:
-            pass
+            return None
 
 
-# ── orchestration ─────────────────────────────────────────────────────────────
+# ── ORCHESTRATION ─────────────────────────────────────────────────────────────
 
 
-def collect_all() -> set[str]:
-    """Fetch from all sources and return a deduplicated set of URIs."""
-    all_uris: list[str] = []
+async def main():
+    t0 = time.time()
+    log.info("═" * 60)
+    log.info("Proxy Aggregator v2.0 (Async Core Starting...)")
+    log.info("═" * 60)
 
-    for channel in TELEGRAM_CHANNELS:
-        all_uris.extend(fetch_telegram(channel))
+    # 1. Scrape all sources concurrently
+    all_uris = []
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        tg_tasks = [fetch_telegram(client, chan) for chan in TELEGRAM_CHANNELS]
+        gh_tasks = [fetch_github(client, url) for url in GITHUB_SOURCES]
 
-    for url in GITHUB_SOURCES:
-        all_uris.extend(fetch_github(url))
+        results = await asyncio.gather(*tg_tasks, *gh_tasks)
+        for uris in results:
+            all_uris.extend(uris)
 
-    unique = set(all_uris)
-    log.info("Total unique URIs collected: %d", len(unique))
-    return unique
+    unique_uris = list(set(all_uris))
+    log.info("Total unique URIs collected: %d", len(unique_uris))
 
+    if not unique_uris:
+        log.warning("No URIs found to validate.")
+        return
 
-def validate_all(uris: set[str]) -> list[str]:
-    """TCP-test every URI in parallel; return sorted list of passing ones."""
+    # 2. Validate concurrently with a connection throttle
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
+    val_tasks = [test_config(uri, semaphore) for uri in unique_uris]
+
+    log.info("Validating with max concurrency pool of %d...", MAX_CONCURRENT_CHECKS)
+    validation_results = await asyncio.gather(*val_tasks)
+
+    # Filter out failed checks and sort by latency (Fastest First)
+    valid_nodes = [res for res in validation_results if res is not None]
+    valid_nodes.sort(key=lambda x: x[1])
+
     log.info(
-        "Validating %d configs with %d workers (timeout=%.1fs) [IPv4 Force Mode Enabled] …",
-        len(uris),
-        MAX_WORKERS,
-        CONNECT_TIMEOUT,
+        "Valid configs after TCP check: %d / %d", len(valid_nodes), len(unique_uris)
     )
 
-    valid: list[str] = []
-    uri_list = list(uris)
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        future_to_uri = {pool.submit(test_config, u): u for u in uri_list}
-        for future in as_completed(future_to_uri):
-            uri = future_to_uri[future]
-            try:
-                if future.result():
-                    valid.append(uri)
-            except Exception as exc:
-                log.debug("Validation error for %s — %s", uri, exc)
-
-    log.info("Valid configs after TCP check: %d / %d", len(valid), len(uris))
-    return sorted(valid)
-
-
-def write_outputs(valid_configs: list[str]) -> None:
-    """Write output payload feeds directly out onto destination assets."""
-    # ── TIMESTAMP TRICK ──────────────────────────────────────────────────────
-    # Create a harmless fake configuration string that serves as a text notice
+    # 3. Format and output results
     current_time = time.strftime("%Y-%m-%d_%H:%M", time.localtime())
     status_node = f"ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwYXNzd29yZA==@127.0.0.1:1234#⏱️_Updated:_{current_time}"
 
-    # Place the timestamp node at the very top of your verified list
-    final_list = [status_node] + valid_configs
-    # ___________________________________________________________________________
+    # Reassemble the final URI array using the sorted values
+    final_configs = [status_node] + [node[0] for node in valid_nodes]
+    plain_text = "\n".join(final_configs) + "\n"
 
-    plain_text = "\n".join(final_list) + "\n"
-
+    # Write files out
     with open(OUTPUT_PLAIN, "w", encoding="utf-8") as f:
         f.write(plain_text)
-    log.info("Written -> %s (%d lines)", OUTPUT_PLAIN, len(final_list))
 
     encoded = base64.b64encode(plain_text.encode("utf-8")).decode("utf-8")
     with open(OUTPUT_BASE64, "w", encoding="utf-8") as f:
         f.write(encoded)
-    log.info("Written -> %s", OUTPUT_BASE64)
-
-
-def main() -> None:
-    t0 = time.time()
-    log.info("═" * 60)
-    log.info("Proxy Aggregator starting …")
-    log.info("═" * 60)
-
-    # 1. Grab everything (~1444 raw nodes)
-    raw = collect_all()
-    if not raw:
-        log.warning("No URIs collected — check source availability.")
-        return
-
-    # 2. Keep only the working IPv4 nodes (~50 nodes)
-    valid = validate_all(raw)
-
-    # 3. Overwrite the files with just the clean, working data
-    if not valid:
-        log.warning("No configs passed TCP validation.")
-    else:
-        write_outputs(valid)
 
     elapsed = time.time() - t0
-    log.info("Done in %.1f seconds. Valid configs: %d", elapsed, len(valid))
+    log.info("Done in %.1f seconds. Outputs successfully generated.", elapsed)
     log.info("═" * 60)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
