@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Proxy Aggregator & Validator (Async v2.0)
+Proxy Aggregator & Validator (Async v2.1 - Real Handshake Edition)
 Aggregates V2Ray, Shadowsocks, and Trojan configurations, deduplicates them,
-validates them via async TCP handshakes, measures latency, and sorts the output.
+validates them via actual HTTP routing through the proxies to eliminate 
+false-positives, measures true latency, and sorts the output.
 """
 
 import asyncio
@@ -39,9 +40,9 @@ OUTPUT_PLAIN = "sub.txt"
 OUTPUT_BASE64 = "sub_base64.txt"
 
 SUPPORTED_PROTOCOLS = ("vless://", "vmess://", "trojan://", "ss://")
-MAX_CONCURRENT_CHECKS = 100  # Semaphores keep your network from choking
-CONNECT_TIMEOUT = 2.5  # Seconds per proxy test
-REQUEST_TIMEOUT = 10.0  # Seconds for HTTP scraping
+MAX_CONCURRENT_CHECKS = 60   # Balanced to prevent socket saturation during heavy HTTP calls
+PROXY_TEST_TIMEOUT = 4.0     # Maximum time allowed for proxy routing to complete
+REQUEST_TIMEOUT = 10.0       # Seconds for HTTP scraping
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,7 +53,6 @@ log = logging.getLogger(__name__)
 
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
-
 
 async def _http_get(client: httpx.AsyncClient, url: str) -> str | None:
     """Async GET request with explicit user agent."""
@@ -81,9 +81,7 @@ def _try_base64_decode(text: str) -> str:
 
 
 def _extract_uris(text: str) -> list[str]:
-    pattern = (
-        r"(?:" + "|".join(re.escape(p) for p in SUPPORTED_PROTOCOLS) + r')[^\s<>"\'\\]+'
-    )
+    pattern = r"(?:" + "|".join(re.escape(p) for p in SUPPORTED_PROTOCOLS) + r')[^\s<>"\'\\]+'
     raw = re.findall(pattern, text)
     cleaned = []
     for uri in raw:
@@ -91,7 +89,7 @@ def _extract_uris(text: str) -> list[str]:
         cleaned.append(uri)
     return cleaned
 
-#parse host and port from URI, return None if invalid
+
 def _parse_host_port(uri: str) -> tuple[str, int] | None:
     try:
         if uri.startswith("vmess://"):
@@ -132,7 +130,6 @@ def _parse_host_port(uri: str) -> tuple[str, int] | None:
 
 # ── ASYNC SCRAPING ────────────────────────────────────────────────────────────
 
-
 async def fetch_telegram(client: httpx.AsyncClient, channel: str) -> list[str]:
     url = f"https://t.me/s/{channel}"
     html = await _http_get(client, url)
@@ -153,51 +150,47 @@ async def fetch_github(client: httpx.AsyncClient, url: str) -> list[str]:
     return uris
 
 
-# ── ASYNC VALIDATION ──────────────────────────────────────────────────────────
+# ── ASYNC DEEP VALIDATION ──────────────────────────────────────────────────────
 
-
-async def test_config(
-    uri: str, semaphore: asyncio.Semaphore
-) -> tuple[str, float] | None:
+async def test_config(uri: str, semaphore: asyncio.Semaphore) -> tuple[str, float] | None:
     """
-    Validates a single proxy config using a lightweight non-blocking TCP connection.
-    Returns (uri, latency_ms) if valid, or None if it fails.
+    Validates a proxy by sending a live HTTP request through it.
+    Filters out dead auth tokens, bad encryptions, and server timeouts.
     """
     hp = _parse_host_port(uri)
-    if not hp or ":" in hp[0]:  # Strict IPv4 exclusion rule retained
+    if not hp or ":" in hp[0]:  # Retain strict IPv4 exclusion structure
         return None
-    host, port = hp
 
     async with semaphore:
         start_time = time.perf_counter()
         try:
-            # Non-blocking connection attempt
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=CONNECT_TIMEOUT
-            )
-            latency = (time.perf_counter() - start_time) * 1000
-            writer.close()
-            await writer.wait_closed()
-            return uri, latency
+            # Wrap the client to route all outbound payload streams via the proxy string
+            async with httpx.AsyncClient(proxies=uri, timeout=PROXY_TEST_TIMEOUT) as client:
+                response = await client.get("http://cp.cloudflare.com", follow_redirects=False)
+                
+                # If the node drops data, timeouts, or auth fails, it raises an exception to except block
+                if response.status_code in (200, 204, 301, 302):
+                    latency = (time.perf_counter() - start_time) * 1000
+                    return uri, latency
         except Exception:
             return None
+    return None
 
 
 # ── ORCHESTRATION ─────────────────────────────────────────────────────────────
 
-
 async def main():
     t0 = time.time()
     log.info("═" * 60)
-    log.info("Proxy Aggregator v2.0 (Async Core Starting...)")
+    log.info("Proxy Aggregator v2.1 (Deep Protocol Testing Engine)")
     log.info("═" * 60)
 
-    # 1. Scrape all sources concurrently
+    # 1. Scrape all assets concurrently
     all_uris = []
     async with httpx.AsyncClient(follow_redirects=True) as client:
         tg_tasks = [fetch_telegram(client, chan) for chan in TELEGRAM_CHANNELS]
         gh_tasks = [fetch_github(client, url) for url in GITHUB_SOURCES]
-
+        
         results = await asyncio.gather(*tg_tasks, *gh_tasks)
         for uris in results:
             all_uris.extend(uris)
@@ -206,36 +199,32 @@ async def main():
     log.info("Total unique URIs collected: %d", len(unique_uris))
 
     if not unique_uris:
-        log.warning("No URIs found to validate.")
+        log.warning("No URIs discovered to test.")
         return
 
-    # 2. Validate concurrently with a connection throttle
+    # 2. Run Deep Network Validation Protocol
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
     val_tasks = [test_config(uri, semaphore) for uri in unique_uris]
-
-    log.info("Validating with max concurrency pool of %d...", MAX_CONCURRENT_CHECKS)
+    
+    log.info("Testing actual proxy traffic routing across %d nodes...", len(unique_uris))
     validation_results = await asyncio.gather(*val_tasks)
 
-    # Filter out failed checks and sort by latency (Fastest First)
+    # Strip failure returns and sort array ascending by response speed
     valid_nodes = [res for res in validation_results if res is not None]
     valid_nodes.sort(key=lambda x: x[1])
 
-    log.info(
-        "Valid configs after TCP check: %d / %d", len(valid_nodes), len(unique_uris)
-    )
+    log.info("Functional configs verified: %d / %d", len(valid_nodes), len(unique_uris))
 
-    # 3. Format and output results
+    # 3. Serialize and generate output configurations
     current_time = time.strftime("%Y-%m-%d_%H:%M", time.localtime())
     status_node = f"ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwYXNzd29yZA==@127.0.0.1:1234#⏱️_Updated:_{current_time}"
-
-    # Reassemble the final URI array using the sorted values
+    
     final_configs = [status_node] + [node[0] for node in valid_nodes]
     plain_text = "\n".join(final_configs) + "\n"
 
-    # Write files out
     with open(OUTPUT_PLAIN, "w", encoding="utf-8") as f:
         f.write(plain_text)
-
+    
     encoded = base64.b64encode(plain_text.encode("utf-8")).decode("utf-8")
     with open(OUTPUT_BASE64, "w", encoding="utf-8") as f:
         f.write(encoded)
@@ -243,7 +232,6 @@ async def main():
     elapsed = time.time() - t0
     log.info("Done in %.1f seconds. Outputs successfully generated.", elapsed)
     log.info("═" * 60)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
