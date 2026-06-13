@@ -91,7 +91,7 @@ def _extract_uris(text: str) -> list[str]:
         cleaned.append(uri)
     return cleaned
 
-
+#parse host and port from URI, return None if invalid
 def _parse_host_port(uri: str) -> tuple[str, int] | None:
     try:
         if uri.startswith("vmess://"):
